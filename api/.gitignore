@@ -1,0 +1,23 @@
+node_modules
+
+# Build output
+dist
+build
+*.tsbuildinfo
+
+# Env files
+.env
+.env.*
+!.env.example
+
+# Logs
+*.log
+npm-debug.log*
+
+# Uploads (multer temp storage)
+uploads
+tmp
+
+# OS / editor
+.DS_Store
+Thumbs.db

@@ -1,0 +1,21 @@
+# Compiled binaries
+/workers
+/bin
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+
+# Coverage output
+*.out
+
+# Go workspace files
+go.work
+go.work.sum
+
+# Env files
+.env
+.env.*
+!.env.example
