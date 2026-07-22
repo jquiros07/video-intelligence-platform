@@ -8,8 +8,10 @@
     "cdk": "cdk"
   },
   "devDependencies": {
+    "@types/aws-lambda": "^8.10.162",
     "@types/jest": "^30",
     "@types/node": "^24.10.1",
+    "esbuild": "^0.28.1",
     "jest": "^30",
     "ts-jest": "^29",
     "aws-cdk": "2.1128.1",
@@ -17,6 +19,7 @@
     "typescript": "~5.9.3"
   },
   "dependencies": {
+    "@temporalio/client": "^1.20.3",
     "aws-cdk-lib": "^2.260.0",
     "constructs": "^10.5.0"
   }

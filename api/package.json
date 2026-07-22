@@ -1,7 +1,7 @@
 {
   "name": "api",
   "version": "1.0.0",
-  "description": "video intelligence platform backend api",
+  "description": "video processing pipeline backend api",
   "keywords": [
     "api",
     "backend",
@@ -14,14 +14,22 @@
   "type": "commonjs",
   "main": "index.js",
   "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "dependencies": {
+    "@aws-sdk/client-dynamodb": "^3.930.0",
+    "@aws-sdk/client-s3": "^3.930.0",
+    "@aws-sdk/lib-dynamodb": "^3.930.0",
+    "@aws-sdk/s3-request-presigner": "^3.930.0",
+    "argon2": "^0.45.1",
     "bcrypt": "^6.0.0",
     "dotenv": "^17.4.2",
     "express": "^5.2.1",
     "express-rate-limit": "^8.6.0",
     "helmet": "^8.3.0",
+    "jose": "^6.2.4",
     "jsonwebtoken": "^9.0.3",
     "multer": "^2.2.0",
     "typescript": "^7.0.2",
