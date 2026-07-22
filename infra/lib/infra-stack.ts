@@ -224,8 +224,20 @@ export class InfraStack extends cdk.Stack {
 
     apiService.targetGroup.configureHealthCheck({ path: '/health' });
 
-    usersTable.grantReadWriteData(apiService.taskDefinition.taskRole);
-    videosBucket.grantWrite(apiService.taskDefinition.taskRole);
+    // Scoped to exactly what api/src/data-access does today (PutItem + Query-by-email,
+    // presigned PutObject) rather than the broader grantReadWriteData()/grantWrite() defaults.
+    apiService.taskDefinition.taskRole.addToPrincipalPolicy(new iam.PolicyStatement({
+      actions: ['dynamodb:PutItem'],
+      resources: [usersTable.tableArn],
+    }));
+    apiService.taskDefinition.taskRole.addToPrincipalPolicy(new iam.PolicyStatement({
+      actions: ['dynamodb:Query'],
+      resources: [`${usersTable.tableArn}/index/EmailIndex`],
+    }));
+    apiService.taskDefinition.taskRole.addToPrincipalPolicy(new iam.PolicyStatement({
+      actions: ['s3:PutObject'],
+      resources: [`${videosBucket.bucketArn}/*`],
+    }));
 
     new cdk.CfnOutput(this, 'VideosBucketName', { value: videosBucket.bucketName });
     new cdk.CfnOutput(this, 'TemporalUiUrl', { value: temporalUiOrigin });
