@@ -18,6 +18,7 @@ import (
 	ddbtypes "github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 	"github.com/aws/aws-sdk-go-v2/service/sesv2"
 	"github.com/aws/aws-sdk-go-v2/service/sesv2/types"
+	"go.temporal.io/sdk/activity"
 )
 
 // opensearchService is the SigV4 service name for Amazon OpenSearch Service (managed domains).
@@ -33,9 +34,12 @@ type StoreResultsInput struct {
 // StoreResults indexes the analysis in OpenSearch and emails a summary to the
 // video's uploader via SES.
 func (a *Activities) StoreResults(ctx context.Context, input StoreResultsInput) error {
+	logger := activity.GetLogger(ctx)
+
 	if err := a.indexResults(ctx, input); err != nil {
 		return fmt.Errorf("index results in opensearch: %w", err)
 	}
+	logger.Info("indexed results in opensearch", "videoKey", input.VideoKey)
 
 	userID, err := userIDFromVideoKey(input.VideoKey)
 	if err != nil {
@@ -49,6 +53,7 @@ func (a *Activities) StoreResults(ctx context.Context, input StoreResultsInput) 
 	if err := a.sendSummaryEmail(ctx, input, recipient); err != nil {
 		return fmt.Errorf("send summary email: %w", err)
 	}
+	logger.Info("sent summary email", "recipient", recipient)
 	return nil
 }
 

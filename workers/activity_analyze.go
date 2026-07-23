@@ -26,6 +26,9 @@ const labelDetectionPollInterval = 10 * time.Second
 // AnalyzeFragments runs Amazon Rekognition label detection on each video
 // fragment and returns the distinct labels found per fragment.
 func (a *Activities) AnalyzeFragments(ctx context.Context, input AnalyzeInput) (FragmentLabels, error) {
+	logger := activity.GetLogger(ctx)
+	logger.Info("analyzing fragments", "count", len(input.FragmentKeys))
+
 	results := make(FragmentLabels, len(input.FragmentKeys))
 
 	for _, key := range input.FragmentKeys {
@@ -33,6 +36,7 @@ func (a *Activities) AnalyzeFragments(ctx context.Context, input AnalyzeInput) (
 		if err != nil {
 			return nil, fmt.Errorf("analyze fragment %s: %w", key, err)
 		}
+		logger.Info("fragment analyzed", "key", key, "labels", labels)
 		results[key] = labels
 	}
 

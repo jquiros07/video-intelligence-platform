@@ -26,6 +26,21 @@ const POSTGRES_VERSION = '16';
 // Keep in sync with the OPENSEARCH_INDEX default in workers/main.go.
 const OPENSEARCH_INDEX = 'video-analysis';
 
+// Keep in sync with the taskQueue const in workers/main.go and the ProcessVideoWorkflow
+// function name in workers/workflow.go (the SDK registers workflows under their Go func name).
+const TEMPORAL_TASK_QUEUE = 'video-processing';
+const VIDEO_WORKFLOW_TYPE = 'ProcessVideoWorkflow';
+const TEMPORAL_NAMESPACE = 'default';
+const TEMPORAL_FRONTEND_PORT = 7233;
+const TEMPORAL_UI_PORT = 8080;
+
+const USERS_EMAIL_INDEX = 'EmailIndex';
+
+// Keep in sync with the "videos/"/"fragments/" prefixes workers/activity_split.go
+// writes fragments under and workers/activity_store.go parses userIds from.
+const VIDEOS_KEY_PREFIX = 'videos/';
+const FRAGMENTS_KEY_PREFIX = 'fragments/';
+
 export class InfraStack extends cdk.Stack {
   constructor(scope: Construct, id: string, props?: cdk.StackProps) {
     super(scope, id, props);
@@ -57,7 +72,7 @@ export class InfraStack extends cdk.Stack {
     videosBucket.addEventNotification(
       s3.EventType.OBJECT_CREATED,
       new s3n.SqsDestination(videoUploadQueue),
-      { prefix: 'videos/' },
+      { prefix: VIDEOS_KEY_PREFIX },
     );
 
     // --- Temporal (self-hosted on EC2; Postgres runs as a container on the same instance) ---
@@ -83,8 +98,8 @@ export class InfraStack extends cdk.Stack {
     const temporalUiIngress = new ec2.CfnSecurityGroupIngress(this, 'TemporalUiIngress', {
       groupId: temporalSecurityGroup.securityGroupId,
       ipProtocol: 'tcp',
-      fromPort: 8080,
-      toPort: 8080,
+      fromPort: TEMPORAL_UI_PORT,
+      toPort: TEMPORAL_UI_PORT,
       cidrIp: temporalUiAllowedCidr.valueAsString,
       description: 'Temporal UI access',
     });
@@ -97,7 +112,7 @@ export class InfraStack extends cdk.Stack {
       ],
     });
     const temporalEip = new ec2.CfnEIP(this, 'TemporalEip', { domain: 'vpc' });
-    const temporalUiOrigin = `http://${temporalEip.ref}:8080`;
+    const temporalUiOrigin = `http://${temporalEip.ref}:${TEMPORAL_UI_PORT}`;
 
     const userData = buildTemporalUserData({
       temporalVersion: TEMPORAL_VERSION,
@@ -129,7 +144,7 @@ export class InfraStack extends cdk.Stack {
       allowAllOutbound: true,
     });
 
-    temporalSecurityGroup.addIngressRule(startVideoWorkflowSecurityGroup, ec2.Port.tcp(7233), 'Lambda -> Temporal frontend');
+    temporalSecurityGroup.addIngressRule(startVideoWorkflowSecurityGroup, ec2.Port.tcp(TEMPORAL_FRONTEND_PORT), 'Lambda -> Temporal frontend');
 
     // CDK's default Lambda-managed log group is RETAIN + 2yr retention, which survives
     // `cdk destroy`. POC: destroy it with the stack, keep retention short.
@@ -147,10 +162,10 @@ export class InfraStack extends cdk.Stack {
       securityGroups: [startVideoWorkflowSecurityGroup],
       logGroup: startVideoWorkflowLogGroup,
       environment: {
-        TEMPORAL_ADDRESS: `${temporalInstance.instancePrivateIp}:7233`,
-        TEMPORAL_NAMESPACE: 'default',
-        TEMPORAL_TASK_QUEUE: 'video-processing',
-        VIDEO_WORKFLOW_TYPE: 'ProcessVideoWorkflow',
+        TEMPORAL_ADDRESS: `${temporalInstance.instancePrivateIp}:${TEMPORAL_FRONTEND_PORT}`,
+        TEMPORAL_NAMESPACE,
+        TEMPORAL_TASK_QUEUE,
+        VIDEO_WORKFLOW_TYPE,
       },
     });
 
@@ -170,7 +185,7 @@ export class InfraStack extends cdk.Stack {
     });
 
     usersTable.addGlobalSecondaryIndex({
-      indexName: 'EmailIndex',
+      indexName: USERS_EMAIL_INDEX,
       partitionKey: { name: 'email', type: dynamodb.AttributeType.STRING },
     });
 
@@ -204,7 +219,7 @@ export class InfraStack extends cdk.Stack {
           JWT_EXPIRES_IN: '24h',
           AWS_REGION: this.region,
           DYNAMODB_USERS_TABLE: usersTable.tableName,
-          DYNAMODB_USERS_EMAIL_INDEX: 'EmailIndex',
+          DYNAMODB_USERS_EMAIL_INDEX: USERS_EMAIL_INDEX,
           VIDEOS_BUCKET: videosBucket.bucketName,
           VIDEO_UPLOAD_LIMIT: '50mb',
         },
@@ -221,11 +236,13 @@ export class InfraStack extends cdk.Stack {
     }));
     apiService.taskDefinition.taskRole.addToPrincipalPolicy(new iam.PolicyStatement({
       actions: ['dynamodb:Query'],
-      resources: [`${usersTable.tableArn}/index/EmailIndex`],
+      resources: [`${usersTable.tableArn}/index/${USERS_EMAIL_INDEX}`],
     }));
     apiService.taskDefinition.taskRole.addToPrincipalPolicy(new iam.PolicyStatement({
+      // api/src/helpers/video.ts always builds keys under videos/ (see uploadVideo in
+      // video.controller.ts), so PutObject never needs to reach outside that prefix.
       actions: ['s3:PutObject'],
-      resources: [`${videosBucket.bucketArn}/*`],
+      resources: [`${videosBucket.bucketArn}/${VIDEOS_KEY_PREFIX}*`],
     }));
     apiService.taskDefinition.taskRole.addToPrincipalPolicy(new iam.PolicyStatement({
       // VerifyEmailIdentity doesn't support resource-level permissions — it's what
@@ -270,7 +287,7 @@ export class InfraStack extends cdk.Stack {
       allowAllOutbound: true,
     });
 
-    temporalSecurityGroup.addIngressRule(workerSecurityGroup, ec2.Port.tcp(7233), 'Worker -> Temporal frontend');
+    temporalSecurityGroup.addIngressRule(workerSecurityGroup, ec2.Port.tcp(TEMPORAL_FRONTEND_PORT), 'Worker -> Temporal frontend');
 
     const workerTaskDefinition = new ecs.FargateTaskDefinition(this, 'WorkerTaskDef', {
       // ffmpeg (video splitting) needs more headroom than the API's plain request handling.
@@ -282,8 +299,8 @@ export class InfraStack extends cdk.Stack {
       image: ecs.ContainerImage.fromAsset(path.join(__dirname, '../../workers')),
       logging: ecs.LogDrivers.awsLogs({ streamPrefix: 'worker', logGroup: workerLogGroup }),
       environment: {
-        TEMPORAL_ADDRESS: `${temporalInstance.instancePrivateIp}:7233`,
-        TEMPORAL_NAMESPACE: 'default',
+        TEMPORAL_ADDRESS: `${temporalInstance.instancePrivateIp}:${TEMPORAL_FRONTEND_PORT}`,
+        TEMPORAL_NAMESPACE,
         OPENSEARCH_ENDPOINT: `https://${searchDomain.domainEndpoint}`,
         OPENSEARCH_INDEX: OPENSEARCH_INDEX,
         DYNAMODB_USERS_TABLE: usersTable.tableName,
@@ -304,11 +321,11 @@ export class InfraStack extends cdk.Stack {
     // actually call, same scoped-permissions approach as the API's task role above.
     workerTaskDefinition.taskRole.addToPrincipalPolicy(new iam.PolicyStatement({
       actions: ['s3:GetObject'],
-      resources: [`${videosBucket.bucketArn}/videos/*`, `${videosBucket.bucketArn}/fragments/*`],
+      resources: [`${videosBucket.bucketArn}/${VIDEOS_KEY_PREFIX}*`, `${videosBucket.bucketArn}/${FRAGMENTS_KEY_PREFIX}*`],
     }));
     workerTaskDefinition.taskRole.addToPrincipalPolicy(new iam.PolicyStatement({
       actions: ['s3:PutObject'],
-      resources: [`${videosBucket.bucketArn}/fragments/*`],
+      resources: [`${videosBucket.bucketArn}/${FRAGMENTS_KEY_PREFIX}*`],
     }));
     workerTaskDefinition.taskRole.addToPrincipalPolicy(new iam.PolicyStatement({
       // Rekognition's video label-detection actions don't support resource-level permissions.

@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"go.temporal.io/sdk/activity"
 )
 
 const fragmentDurationSeconds = 30
@@ -21,6 +22,9 @@ const fragmentDurationSeconds = 30
 // Fragments are written under "fragments/", outside the "videos/" prefix the
 // S3 -> SQS -> Lambda trigger watches, so uploading them doesn't start new workflows.
 func (a *Activities) SplitVideo(ctx context.Context, input VideoInput) ([]string, error) {
+	logger := activity.GetLogger(ctx)
+	logger.Info("splitting video", "bucket", input.Bucket, "key", input.Key)
+
 	workDir, err := os.MkdirTemp("", "video-split-*")
 	if err != nil {
 		return nil, fmt.Errorf("create temp dir: %w", err)
@@ -31,6 +35,7 @@ func (a *Activities) SplitVideo(ctx context.Context, input VideoInput) ([]string
 	if err := a.downloadFromS3(ctx, input.Bucket, input.Key, sourcePath); err != nil {
 		return nil, fmt.Errorf("download source video: %w", err)
 	}
+	logger.Info("downloaded source video", "path", sourcePath)
 
 	fragmentPattern := filepath.Join(workDir, "fragment-%03d.mp4")
 	cmd := exec.CommandContext(ctx, "ffmpeg",
@@ -50,6 +55,7 @@ func (a *Activities) SplitVideo(ctx context.Context, input VideoInput) ([]string
 	if err != nil {
 		return nil, fmt.Errorf("list fragments: %w", err)
 	}
+	logger.Info("ffmpeg produced fragments", "count", len(fragmentFiles))
 
 	videoStem := strings.TrimSuffix(input.Key, filepath.Ext(input.Key))
 	fragmentKeys := make([]string, 0, len(fragmentFiles))
@@ -60,6 +66,7 @@ func (a *Activities) SplitVideo(ctx context.Context, input VideoInput) ([]string
 		}
 		fragmentKeys = append(fragmentKeys, fragmentKey)
 	}
+	logger.Info("uploaded fragments", "count", len(fragmentKeys))
 
 	return fragmentKeys, nil
 }
