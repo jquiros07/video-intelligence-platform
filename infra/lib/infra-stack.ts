@@ -6,19 +6,25 @@ import * as ecs from 'aws-cdk-lib/aws-ecs';
 import * as ecsPatterns from 'aws-cdk-lib/aws-ecs-patterns';
 import * as iam from 'aws-cdk-lib/aws-iam';
 import * as logs from 'aws-cdk-lib/aws-logs';
+import * as opensearch from 'aws-cdk-lib/aws-opensearchservice';
 import * as s3 from 'aws-cdk-lib/aws-s3';
 import * as s3n from 'aws-cdk-lib/aws-s3-notifications';
 import * as secretsmanager from 'aws-cdk-lib/aws-secretsmanager';
+import * as ses from 'aws-cdk-lib/aws-ses';
 import * as sqs from 'aws-cdk-lib/aws-sqs';
 import { NodejsFunction } from 'aws-cdk-lib/aws-lambda-nodejs';
 import { SqsEventSource } from 'aws-cdk-lib/aws-lambda-event-sources';
 import * as path from 'path';
+import { buildTemporalUserData } from './temporal-user-data';
 
 // Keep these in sync with temporal/.env.example so the AWS deployment matches
 // what's been run/tested locally via docker-compose.
 const TEMPORAL_VERSION = '1.29.1';
 const TEMPORAL_UI_VERSION = '2.34.0';
 const POSTGRES_VERSION = '16';
+
+// Keep in sync with the OPENSEARCH_INDEX default in workers/main.go.
+const OPENSEARCH_INDEX = 'video-analysis';
 
 export class InfraStack extends cdk.Stack {
   constructor(scope: Construct, id: string, props?: cdk.StackProps) {
@@ -62,14 +68,27 @@ export class InfraStack extends cdk.Stack {
       allowAllOutbound: true,
     });
 
-    // No default: until this is set, port 8080 stays closed rather than risking a
-    // wide-open UI with no login in front of it.
-    const uiAllowedCidr = process.env.TEMPORAL_UI_ALLOWED_CIDR;
-    if (uiAllowedCidr) {
-      temporalSecurityGroup.addIngressRule(ec2.Peer.ipv4(uiAllowedCidr), ec2.Port.tcp(8080), 'Temporal UI access');
-    } else {
-      console.warn('TEMPORAL_UI_ALLOWED_CIDR not set — Temporal UI (port 8080) will not be reachable until you set it and redeploy.');
-    }
+    // Empty by default: until this is set (`cdk deploy --parameters TemporalUiAllowedCidr=x.x.x.x/32`),
+    // port 8080 stays closed rather than risking a wide-open UI with no login in front of it.
+    const temporalUiAllowedCidr = new cdk.CfnParameter(this, 'TemporalUiAllowedCidr', {
+      type: 'String',
+      default: '',
+      description: 'CIDR allowed to reach the Temporal UI (port 8080). Leave blank to keep it closed.',
+    });
+
+    const temporalUiCidrProvided = new cdk.CfnCondition(this, 'TemporalUiCidrProvided', {
+      expression: cdk.Fn.conditionNot(cdk.Fn.conditionEquals(temporalUiAllowedCidr.valueAsString, '')),
+    });
+
+    const temporalUiIngress = new ec2.CfnSecurityGroupIngress(this, 'TemporalUiIngress', {
+      groupId: temporalSecurityGroup.securityGroupId,
+      ipProtocol: 'tcp',
+      fromPort: 8080,
+      toPort: 8080,
+      cidrIp: temporalUiAllowedCidr.valueAsString,
+      description: 'Temporal UI access',
+    });
+    temporalUiIngress.cfnOptions.condition = temporalUiCidrProvided;
 
     const temporalInstanceRole = new iam.Role(this, 'TemporalInstanceRole', {
       assumedBy: new iam.ServicePrincipal('ec2.amazonaws.com'),
@@ -80,42 +99,12 @@ export class InfraStack extends cdk.Stack {
     const temporalEip = new ec2.CfnEIP(this, 'TemporalEip', { domain: 'vpc' });
     const temporalUiOrigin = `http://${temporalEip.ref}:8080`;
 
-    const userData = ec2.UserData.forLinux();
-    userData.addCommands(
-      'dnf install -y docker',
-      'systemctl enable --now docker',
-      'docker network create temporal-network',
-      // Fixed local creds, not Secrets Manager — Postgres is only reachable from inside
-      // this instance's docker network, never exposed to the host or the VPC.
-      [
-        'docker run -d --name temporal-postgresql --restart unless-stopped --network temporal-network',
-        '-e POSTGRES_USER=temporal',
-        '-e POSTGRES_PASSWORD=temporal',
-        '-v temporal-postgres-data:/var/lib/postgresql/data',
-        `postgres:${POSTGRES_VERSION}`,
-      ].join(' '),
-      'until docker exec temporal-postgresql pg_isready -U temporal > /dev/null 2>&1; do sleep 2; done',
-      // No DYNAMIC_CONFIG_FILE_PATH override here on purpose — the repo's local dev
-      // config enables system.forceSearchAttributesCacheRefreshOnRead, which its own
-      // comment flags as dev-only. This uses the image's built-in defaults instead.
-      [
-        'docker run -d --name temporal --restart unless-stopped --network temporal-network',
-        '-e DB=postgres12',
-        '-e DB_PORT=5432',
-        '-e POSTGRES_USER=temporal',
-        '-e POSTGRES_PWD=temporal',
-        '-e POSTGRES_SEEDS=temporal-postgresql',
-        '-p 7233:7233',
-        `temporalio/auto-setup:${TEMPORAL_VERSION}`,
-      ].join(' '),
-      [
-        'docker run -d --name temporal-ui --restart unless-stopped --network temporal-network',
-        '-e TEMPORAL_ADDRESS=temporal:7233',
-        `-e TEMPORAL_CORS_ORIGINS=${temporalUiOrigin}`,
-        '-p 8080:8080',
-        `temporalio/ui:${TEMPORAL_UI_VERSION}`,
-      ].join(' '),
-    );
+    const userData = buildTemporalUserData({
+      temporalVersion: TEMPORAL_VERSION,
+      temporalUiVersion: TEMPORAL_UI_VERSION,
+      postgresVersion: POSTGRES_VERSION,
+      temporalUiOrigin,
+    });
 
     const temporalInstance = new ec2.Instance(this, 'TemporalInstance', {
       vpc,
@@ -238,9 +227,104 @@ export class InfraStack extends cdk.Stack {
       actions: ['s3:PutObject'],
       resources: [`${videosBucket.bucketArn}/*`],
     }));
+    apiService.taskDefinition.taskRole.addToPrincipalPolicy(new iam.PolicyStatement({
+      // VerifyEmailIdentity doesn't support resource-level permissions — it's what
+      // creates the identity, so there's no ARN to scope to beforehand.
+      actions: ['ses:VerifyEmailIdentity'],
+      resources: ['*'],
+    }));
+
+    // --- Worker: OpenSearch (results) + SES (notification email) + ECS Fargate service ---
+
+    // CDK creates this as an SES identity below; check this address's inbox for AWS's
+    // verification email after deploying (SES starts in sandbox mode either way, so
+    // recipients need verifying too until the account is moved out of it).
+    const sesSenderEmail = new cdk.CfnParameter(this, 'SesSenderEmail', {
+      type: 'String',
+      description: 'Email address the video-analysis worker sends completion notifications from.',
+    });
+
+    const senderIdentity = new ses.EmailIdentity(this, 'SenderIdentity', {
+      identity: ses.Identity.email(sesSenderEmail.valueAsString),
+    });
+
+    // Public (non-VPC) domain: reachable over the NAT gateway the private subnet
+    // already has, and access-controlled via IAM (see grantIndexReadWrite below)
+    // instead of the extra VPC/security-group wiring a VPC-attached domain needs.
+    const searchDomain = new opensearch.Domain(this, 'SearchDomain', {
+      version: opensearch.EngineVersion.OPENSEARCH_2_19,
+      // Single node, single AZ: t3.small.search doesn't support the Multi-AZ-with-standby
+      // default this CDK app's feature flags would otherwise turn on.
+      capacity: { dataNodes: 1, dataNodeInstanceType: 't3.small.search', multiAzWithStandbyEnabled: false },
+      removalPolicy: cdk.RemovalPolicy.DESTROY,
+    });
+
+    const workerLogGroup = new logs.LogGroup(this, 'WorkerLogGroup', {
+      retention: logs.RetentionDays.ONE_WEEK,
+      removalPolicy: cdk.RemovalPolicy.DESTROY,
+    });
+
+    const workerSecurityGroup = new ec2.SecurityGroup(this, 'WorkerSg', {
+      vpc,
+      description: 'video-processing worker',
+      allowAllOutbound: true,
+    });
+
+    temporalSecurityGroup.addIngressRule(workerSecurityGroup, ec2.Port.tcp(7233), 'Worker -> Temporal frontend');
+
+    const workerTaskDefinition = new ecs.FargateTaskDefinition(this, 'WorkerTaskDef', {
+      // ffmpeg (video splitting) needs more headroom than the API's plain request handling.
+      cpu: 1024,
+      memoryLimitMiB: 2048,
+    });
+
+    workerTaskDefinition.addContainer('WorkerContainer', {
+      image: ecs.ContainerImage.fromAsset(path.join(__dirname, '../../workers')),
+      logging: ecs.LogDrivers.awsLogs({ streamPrefix: 'worker', logGroup: workerLogGroup }),
+      environment: {
+        TEMPORAL_ADDRESS: `${temporalInstance.instancePrivateIp}:7233`,
+        TEMPORAL_NAMESPACE: 'default',
+        OPENSEARCH_ENDPOINT: `https://${searchDomain.domainEndpoint}`,
+        OPENSEARCH_INDEX: OPENSEARCH_INDEX,
+        DYNAMODB_USERS_TABLE: usersTable.tableName,
+        SENDER_EMAIL: sesSenderEmail.valueAsString,
+        AWS_REGION: this.region,
+      },
+    });
+
+    new ecs.FargateService(this, 'WorkerService', {
+      cluster: apiCluster,
+      taskDefinition: workerTaskDefinition,
+      desiredCount: 1,
+      vpcSubnets: { subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS },
+      securityGroups: [workerSecurityGroup],
+    });
+
+    // Matches what workers/activity_split.go, activity_analyze.go and activity_store.go
+    // actually call, same scoped-permissions approach as the API's task role above.
+    workerTaskDefinition.taskRole.addToPrincipalPolicy(new iam.PolicyStatement({
+      actions: ['s3:GetObject'],
+      resources: [`${videosBucket.bucketArn}/videos/*`, `${videosBucket.bucketArn}/fragments/*`],
+    }));
+    workerTaskDefinition.taskRole.addToPrincipalPolicy(new iam.PolicyStatement({
+      actions: ['s3:PutObject'],
+      resources: [`${videosBucket.bucketArn}/fragments/*`],
+    }));
+    workerTaskDefinition.taskRole.addToPrincipalPolicy(new iam.PolicyStatement({
+      // Rekognition's video label-detection actions don't support resource-level permissions.
+      actions: ['rekognition:StartLabelDetection', 'rekognition:GetLabelDetection'],
+      resources: ['*'],
+    }));
+    workerTaskDefinition.taskRole.addToPrincipalPolicy(new iam.PolicyStatement({
+      actions: ['dynamodb:GetItem'],
+      resources: [usersTable.tableArn],
+    }));
+    searchDomain.grantIndexReadWrite(OPENSEARCH_INDEX, workerTaskDefinition.taskRole);
+    senderIdentity.grantSendEmail(workerTaskDefinition.taskRole);
 
     new cdk.CfnOutput(this, 'VideosBucketName', { value: videosBucket.bucketName });
     new cdk.CfnOutput(this, 'TemporalUiUrl', { value: temporalUiOrigin });
     new cdk.CfnOutput(this, 'ApiUrl', { value: `http://${apiService.loadBalancer.loadBalancerDnsName}` });
+    new cdk.CfnOutput(this, 'SearchDomainEndpoint', { value: searchDomain.domainEndpoint });
   }
 }

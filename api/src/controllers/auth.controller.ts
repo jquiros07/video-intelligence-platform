@@ -1,6 +1,7 @@
 import { Request, Response } from 'express';
 import { RegisterInput, LoginInput } from '../types/auth.types';
 import { createUser, findUserByEmail } from '../data-access/user.data-access';
+import { verifyEmailIdentity } from '../helpers/ses';
 import { hashPassword, verifyPassword } from '../helpers/password';
 import { signToken } from '../helpers/jwt';
 
@@ -15,6 +16,7 @@ export const registerUser = async (request: Request, response: Response): Promis
 
         const passwordHash = await hashPassword(password);
         const user = await createUser(name, lastname, email, passwordHash);
+        await verifyEmailIdentity(email);
 
         return response.status(201).json({ message: 'User created successfully!' });
     } catch (error) {

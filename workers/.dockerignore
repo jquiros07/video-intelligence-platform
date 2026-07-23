@@ -1,0 +1,6 @@
+workers.exe
+*.exe
+bin
+.env
+.env.*
+!.env.example
